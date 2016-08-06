@@ -1,0 +1,136 @@
+d2 10
+a11 2
+|*  RIT I - MIEEC - FCT/UNL				Luis Bernardo	     *|
+|*            callbacks.h						     *|
+d14 14
+a27 3
+// Janela principal
+extern GtkWidget *window1;
+// Directoria para escrever ficheiros de saida
+d29 5
+a33 2
+// Nome de utilizador
+extern char *nome_utiliz;
+a37 4
+#include <gnome.h>
+#include <netinet/in.h>
+#include "gui.h"
+
+d39 1
+a39 1
+#define MAX_COMP_MENSAGEM	9000
+d41 3
+a43 4
+/* Tipos de pacotes */
+#define REGISTO_NOME		1
+#define CANCELA_NOME		2
+#define DADOS_MULTICAST		10
+d45 1
+a45 1
+/* Periodos de relógio */
+a47 36
+// TRUE se servidor esta' ligado
+extern gboolean activo;	
+// TRUE se IPv4 esta' ligado
+extern gboolean activo4; 
+// TRUE se IPv6 esta' ligado
+extern gboolean activo6; 
+// porto multicast IPv4/IPv6
+extern u_short porto_MCast;	
+
+// endereco IPv4 multicast
+extern const char *endereco_MCast4;
+// Dados do socket publico IPv4
+extern struct sockaddr_in addr_MCast4;	
+// Dados de registo no grupo IPv4
+extern struct ip_mreq  imr_MCast4;	
+
+// endereco IPv6 multicast
+extern const char *endereco_MCast6;
+// Dados do socket publico
+extern struct sockaddr_in6 addr_MCast6;	
+// Dados de registo no grupo
+extern struct ipv6_mreq  imr_MCast6;	
+
+// descritor do socket UDP IPv4
+extern int sockUDP4;	
+// descritor do socket UDP IPv6 
+extern int sockUDP6;	
+// Descritor do canal do socket UDP 
+extern GIOChannel *chanUDP; 
+// Numero de canal do socket UDP
+extern guint chanUDP_id;	
+
+// Numero de porto associado ao socket TCP
+extern u_short porto_TCP;	
+// FALTA DECLARAR AS OUTRAS VARIÁVEIS PARA SUPORTAR A COMUNICAÇÃO TCP
+
+d49 21
+a69 5
+
+/****************************************************\
+|* Funcoes para lidar com lista de participantes    *|
+\****************************************************/
+// Envia mensagem utilizando socket multicast
+d71 46
+a116 24
+// Cria mensagem NAME e envia-a
+void multicast_nome(gboolean regista);
+// Callback para receber dados UDP do socket
+gboolean callback_dados_UDP(GIOChannel *source, GIOCondition condition,
+			    gpointer data);
+
+/*****************************************************************************\
+|* Funcoes para lidar com a Lista de processos de transferencia de ficheiros *|
+\*****************************************************************************/
+// Devolve comprimento do ficheiro
+long get_filesize(const char *FileName);
+// Exclui directoria do nome do ficheiro
+const char *get_trunc_filename(const char *FileName);
+
+/***********************************\
+|* Funcoes para controlar sockets  *|
+\***********************************/
+// Fecha socket UDP
+void close_sockUDP();
+// Fecha socket TCP
+void close_sockTCP();
+// Cria socket UDP IPv4, configura-o, e regista callback
+// Recebe configuracoes atraves de variaveis globais:
+//   porto_MCast - porto multicast
+d118 3
+a120 7
+// Cria socket UDP IPv6, configura-o, e regista callback
+// Recebe configuracoes atraves de variaveis globais
+//   porto_MCast - porto multicast
+gboolean init_socket_udp6(const char *addr_multicast);
+// Cria socket UDP IPv6, configura-o, e regista callback
+// Recebe configuracoes atraves de variaveis globais
+//   porto_MCast - porto multicast
+d122 30
+a151 25
+
+/**************************************************\
+|* Funcoes para controlar transferencia ficheiros *|
+\**************************************************/
+// Inicia envio de ficheiro para participante seleccionado
+void on_buttonSessao_clicked(GtkButton *button, gpointer user_data);
+// Pára transmissão de ficheiro seleccionada
+void on_buttonParar_clicked(GtkButton *button, gpointer user_data);
+// Pára transmissão de todos os ficheiros
+void stop_all_files();
+
+/**********************************************\
+|* Funcoes para controlar estado da aplicação *|
+\**********************************************/
+// Pára todas as tarefas da aplicação deixando-a inactiva
+void close_all();
+// Botão de arranque/paragem da aplicação
+void on_togglebutton1_toggled(GtkToggleButton *togglebutton, gpointer user_data);
+// Modifica o botão IPv6, redefinindo o endereco multicast e o socket
+void on_checkbuttonIPv4_toggled(GtkToggleButton *togglebutton, gpointer user_data);
+// Modifica o botão IPv4, redefinindo o endereco multicast e o socket
+void on_checkbuttonIPv6_toggled(GtkToggleButton *togglebutton, gpointer user_data);
+// Se a janela principal fecha
+gboolean on_window1_delete_event(GtkWidget *widget, GdkEvent *event, gpointer user_data);
+

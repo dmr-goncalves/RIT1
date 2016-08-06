@@ -1,0 +1,114 @@
+d2 9
+a10 2
+|*  RIT I - MIEEC - FCT/UNL				Luis Bernardo	     *|
+|*            subprocess.c						     *|
+d16 1
+a16 1
+#include <gnome.h>
+d27 3
+a33 2
+#include "interface.h"
+#include "support.h"
+d35 1
+d39 1
+a39 1
+#define debugstr(x)     g_print(x)
+d45 1
+a45 1
+// Buffer temporário
+d50 32
+a81 32
+/*******************************************************\
+|* Funcoes para tratar subprocessos de tx de ficheiros *|
+\*******************************************************/
+
+// Variaveis globais usadas nos subprocessos
+int s;	// Descritor de socket TCP
+char nome_str[80];
+gboolean sinal= FALSE;
+int sp; // Descritor de pipe
+int len_sp= 0; // Comprimento do bloco a tratar no subprocesso
+long total= 0;  // Dados tratados no subprocesso
+long flen= 0;
+
+
+// Envia sinal a processo
+void send_kill(int pid, int sig, gboolean pode_falhar) {
+  assert(sig>0);
+  assert(pid>0);
+  
+  char nome[80];
+  switch(sig) {
+    case SIGKILL:
+      sprintf(nome, "SIGKILL");
+      break;
+    case SIGUSR1:
+      sprintf(nome, "SIGUSR1");
+      break;
+    default:
+      sprintf(nome, "%d", sig);
+  }
+  
+  if (!kill(pid, sig)) {
+d83 2
+a84 2
+    sprintf(tmp_buf, "Enviado Kill(%s) para subprocesso %d\n", nome, pid);
+    Log(tmp_buf);
+d86 7
+a92 7
+  } else {
+    if (!pode_falhar) {
+      sprintf(tmp_buf, "Falhou kill(%s) para subprocesso %d: %s\n", 
+        nome, pid, strerror(errno));
+      Log(tmp_buf);
+    }
+  }
+d96 1
+a96 1
+// Callback de sinal SIGCHLD no processo principal
+d99 4
+a102 4
+  sigset_t set, oldset;
+  pid_t pid;
+  union wait status;
+  gboolean free_mem= TRUE;
+d105 1
+a105 1
+  fprintf(stderr, "reaper arrancou\n");
+d107 32
+a138 31
+  // Reinstalar tratamento de signal
+  //signal(SIGCHLD, reaper);
+  // bloqueia outros sinais SIGCHLD
+  sigemptyset(&set);
+  sigaddset(&set, SIGCHLD);
+  sigprocmask(SIG_BLOCK, &set, &oldset);
+
+  while ((pid= wait3(&status, WNOHANG, 0)) > 0) {
+    if (WIFEXITED(status)) {
+      fprintf(stderr, "Processo filho (pid= %d) terminou com exit(%d)\n",
+        (int)pid, (int)WEXITSTATUS(status));
+      if (WEXITSTATUS(status) == 0)
+      	free_mem= FALSE;
+    } else if (WIFSIGNALED(status))
+      fprintf(stderr, "Processo filho (pid= %d) terminou com kill(%d)\n",
+        (int)pid, (int)WTERMSIG(status));
+    else
+      fprintf(stderr, "Processo filho (pid= %d) terminou\n", (int)pid);
+    if (free_mem) {
+      // FALTA TRATAR MORTE DO PROCESSO FILHO 
+      //     LIMPANDO TODOS OS RECURSOS ALOCADOS AO SUBPROCESSO	
+      // ????
+    }
+    continue;
+  }
+  //Desbloquear signal SIGCHLD
+  sigemptyset(&set);
+  sigaddset(&set, SIGCHLD);
+  sigprocmask(SIG_UNBLOCK, &set, &oldset);
+  // Reinstalar tratamento de signal
+  signal(SIGCHLD, reaper);
+d140 1
+a140 1
+  fprintf(stderr, "reaper terminou\n");
+d143 615

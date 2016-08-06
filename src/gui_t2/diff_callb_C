@@ -1,0 +1,1369 @@
+d2 2
+a3 9
+ * Redes Integradas de Telecomunicacoes I
+ * MIEEC - FCT/UNL  2015/2016
+ *
+ * callbacks.c
+ *
+ * Functions that handle main application logic for UDP communication, controlling query forwarding
+ *
+ * Updated on September 25, 19:00
+ * @author  Luis Bernardo, Rodolfo Oliveira
+d5 6
+a10 2
+#include <gtk/gtk.h>
+#include <arpa/inet.h>
+d12 5
+a16 9
+#include <signal.h>
+#include <assert.h>
+#include <time.h>
+#include <memory.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <errno.h>
+#include <fcntl.h>
+a17 1
+#include "file.h"
+a19 1
+#include "callbacks.h"
+a26 3
+/**********************\
+|*  Global variables  *|
+\**********************/
+d28 2
+a29 4
+gboolean active = FALSE; 	// TRUE if server is active
+char *user_name = NULL; // User name
+gboolean active4 = FALSE; // TRUE if IPv4 is on and IPv6 if off
+gboolean active6 = FALSE; // TRUE if IPv6 is on and IPv4 is off
+d31 2
+a32 1
+guint query_timer_id = 0; // Timer event
+d34 1
+a34 1
+gboolean changing = FALSE; // If it is changing the network
+d36 3
+a38 1
+GList *tcp_conn = NULL; // List with active TCP connections/subprocesses
+d40 3
+d44 4
+a47 4
+/******************************\
+|*  Network Global variables  *|
+\******************************/
+u_short port_MCast = 0; // IPv4/IPv6 Multicast port
+d49 2
+a50 4
+int sockUDP4 = -1; // IPv4 UDP socket descriptor
+const char *str_addr_MCast4 = NULL;// IPv4 multicast address
+struct sockaddr_in addr_MCast4; // struct with data of IPv4 socket
+struct ip_mreq imr_MCast4; // struct with IPv4 multicast data
+a51 4
+int sockUDP6 = -1; // IPv6 UDP socket descriptor
+const char *str_addr_MCast6 = NULL;// IPv6 multicast address
+struct sockaddr_in6 addr_MCast6; // struct with data of IPv6 socket
+struct ipv6_mreq imr_MCast6; // struct with IPv6 multicast data
+d53 1
+a53 2
+GIOChannel *chanUDP = NULL; // GIO channel descriptor of socket UDPv4 or UDPv6
+guint chanUDP_id = 0; // channel number of socket UDPv4 or UDPv6
+d55 1
+a55 14
+guint nome_timer_id = 0; // Timer event id
+
+u_short port_TCP = 0; // TCP port
+int sockTCP = -1; // IPv6 TCP socket descriptor
+GIOChannel *chanTCP = NULL; // GIO channel descriptor of TCPv6 socket
+guint chanTCP_id = 0; // Channel number of socket TCPv6
+
+
+/*********************\
+|*  Local variables  *|
+ \*********************/
+// Used to define unique numbers for incoming files
+static int counter = 0;
+// Temporary buffer
+d60 3
+a62 35
+/****************************************\
+|* Functions to handle list of users    *|
+ \****************************************/
+
+
+// Handle REGISTRATION/CANCELLATION packets
+gboolean process_registration(const char *name, int n, const char *ip_str,
+		u_short port, gboolean registration) {
+
+	if (strlen(name) != n - 1) {
+		Log("Packet with string not terminated with '\\0' - ignored\n");
+		return FALSE;
+	}
+	if (registration) {
+		if (GUI_regist_name(name, ip_str, port)) {
+			// New registration
+			if (!strcmp(user_name, name)) {
+				// Same name as the local name
+				if (is_local_ip(ip_str) && (port == port_TCP)) {
+					// Same socket - ignored
+					return FALSE;
+				}
+			}
+		} else
+			return FALSE;
+	} else {
+		// Cancellation
+		if (!GUI_cancel_name(name, ip_str, port)) {
+			sprintf(tmp_buf, "Cancellation of unknown user '%s'\n", name);
+			Log(tmp_buf);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+d64 24
+a87 24
+
+// Sends a message using the IPv6 multicast socket
+gboolean send_multicast(const char *buf, int n) {
+	if (!active) {
+		debugstr("active is false in send_multicast\n");
+		return FALSE;
+	}
+	assert(active4 ^ active6);
+	assert((sockUDP4>0) ^ (sockUDP6>0));
+	// Sends message.
+	if (active4) {
+		if (sendto(sockUDP4, buf, n, 0, (struct sockaddr *) &addr_MCast4,
+				sizeof(addr_MCast4)) < 0) {
+			perror("Error while sending multicast datagram");
+			return FALSE;
+		}
+	} else {
+		if (sendto(sockUDP6, buf, n, 0, (struct sockaddr *) &addr_MCast6,
+				sizeof(addr_MCast6)) < 0) {
+			perror("Error while sending multicast datagram");
+			return FALSE;
+		}
+	}
+	return TRUE;
+d91 5
+a95 14
+// Create a REGISTRATION/CANCELLATION message with the name and sends it
+void multicast_name(gboolean registration) {
+	unsigned char cod;
+	char *pt = tmp_buf;
+
+	assert(user_name != NULL);
+	assert(port_TCP>0);
+	cod = (registration ? REGISTRATION_NAME : CANCELLATION_NAME);
+	WRITE_BUF(pt, &cod, 1);
+	WRITE_BUF(pt, &port_TCP, 2);
+	WRITE_BUF(pt, user_name, strlen(user_name)+1);
+	send_multicast(tmp_buf, pt - tmp_buf);
+}
+
+d97 7
+a103 31
+// Test the timer for all neighbors
+void test_all_name_timer(void) {
+	GtkTreeModel *list_store = GTK_TREE_MODEL(main_window->listUsers);
+	GtkTreeIter iter;
+	gboolean valid;
+
+	// Get the first iter in the list
+	valid = gtk_tree_model_get_iter_first(list_store, &iter);
+
+	while (valid) {
+		// Walk through the list, reading each row
+		if (!GUI_test_name_timer(&iter)) {
+			gchar *ip;
+			int port;
+			gchar *name;
+
+			gtk_tree_model_get(list_store, &iter, 0, &ip, 1, &port, 2, &name, -1);
+			sprintf(tmp_buf,
+					"User '%s' removed for not sending name registration\n",
+					name);
+			g_print("%s", tmp_buf);
+			Log(tmp_buf);
+			process_registration(name, strlen(name) + 1, ip, port, FALSE);
+			g_free(name);
+			g_free(ip);
+			// Reset iter to the beginning of the list
+			valid = gtk_tree_model_get_iter_first(list_store, &iter);
+		} else {
+			valid = gtk_tree_model_iter_next(list_store, &iter);
+		}
+	}
+d107 65
+a171 14
+// Timer callback for periodical registration of the server's name
+gboolean callback_name_timer(gpointer data) {
+	// data - entrymSec with number
+	if (!active)
+		return FALSE;
+	if (changing) {
+		debugstr("Callback_name_timer while changing\n");
+		return TRUE;
+	}
+	debugstr("Callback_name_timer sent NAME\n");
+	multicast_name(TRUE);
+	test_all_name_timer();
+	// reaper(SIGCHLD);
+	return TRUE; // periodic timer
+d175 3
+a177 82
+// Callback to receive data from UDP socket
+gboolean callback_UDP_data(GIOChannel *source, GIOCondition condition,
+		gpointer data) {
+	static char buf[MESSAGE_MAX_LENGTH]; // buffer for reading data
+	struct in6_addr ipv6;
+	struct in_addr ipv4;
+	char ip_str[81];
+	u_short port;
+	int n;
+
+	assert(main_window != NULL);
+	if (!active) {
+		debugstr("callback_UDP_data with active FALSE\n");
+		return FALSE;
+	}
+	if (condition == G_IO_IN) {
+		// Receive packet //
+		if (active6) {
+			n = read_data_ipv6(sockUDP6, buf, MESSAGE_MAX_LENGTH, &ipv6, &port);
+			strncpy(ip_str, addr_ipv6(&ipv6), sizeof(ip_str));
+		} else if (active4) {
+			n = read_data_ipv4(sockUDP4, buf, MESSAGE_MAX_LENGTH, &ipv4, &port);
+			strncpy(ip_str, addr_ipv4(&ipv4), sizeof(ip_str));
+		} else {
+			if (changing)
+				return TRUE;
+			assert(active6 || active4);
+		}
+		if (n <= 0) {
+			Log("Failed reading packet from multicast socket\n");
+			return TRUE; // Continue waiting for more events
+		} else {
+			time_t tbuf;
+			unsigned char m;
+			char *pt;
+
+			// Read data //
+			pt = buf;
+			READ_BUF(pt, &m, 1); // Reads type and advances pointer
+			READ_BUF(pt, &port, 2); // Reads port and advances pointer
+			// Writes date and sender's data //
+			time(&tbuf);
+			sprintf(tmp_buf, "%sReceived %d bytes from %s#%hu - type %hhd\n",
+					ctime(&tbuf), n, ip_str, port, m);
+			g_print("%s", tmp_buf);
+			switch (m) {
+			case REGISTRATION_NAME:
+				sprintf(tmp_buf, "Registration of '%s' - %s#%hu\n", pt, ip_str,
+						port);
+				if (process_registration(pt, n - 3, ip_str, port, TRUE))
+					Log(tmp_buf);
+				else
+					g_print("%s", tmp_buf);
+				break;
+			case CANCELLATION_NAME:
+				sprintf(tmp_buf, "Cancellation of '%s' - %s#%hu\n", pt, ip_str,
+						port);
+				if (process_registration(pt, n - 3, ip_str, port, FALSE))
+					Log(tmp_buf);
+				else
+					g_print("%s", tmp_buf);
+				break;
+			default:
+				sprintf(tmp_buf, "Invalid packet type (%d) - ignored\n",
+						(int) m);
+				Log(tmp_buf);
+				break;
+			}
+			return TRUE; // Keeps receiving more packets
+		}
+	} else if ((condition == G_IO_NVAL) || (condition == G_IO_ERR)) {
+		Log("Error detected in UDP socket\n");
+		// Turns sockets off
+		close_all();
+		// Closes the application
+		gtk_main_quit();
+		return FALSE; // Stops callback for receiving packets from socket
+	} else {
+		assert(0); // Should never reach this line
+		return FALSE; // Stops callback for receiving packets from socket
+	}
+}
+d179 9
+a187 24
+
+
+/*************************************************************\
+|* Functions to handle the list of file transfer processes   *|
+ \************************************************************/
+
+// Add subprocess information to process list
+Dados *put_in_process_list(int pid, int pipe, const char *filename,
+		gboolean sending) {
+	Dados *pt;
+	//  g_print("new_desc(pid=%d ; pipe=%d ; %s)\n", pid, pipe, sending?"SND":"RCV");
+	pt = (Dados *) malloc(sizeof(Dados));
+	pt->pid = pid;
+	pt->pipe = pipe;
+	strcpy(pt->fname, filename);
+	pt->sending = sending;
+	if (!put_socket_in_mainloop(pt->pipe, pt, &pt->chan_id, &pt->chan, G_IO_IN,
+			callback_pipe)) {
+		fprintf(stderr, "failed registration of pipe in Gtk+ loop\n");
+		free(pt);
+		return NULL;
+	}
+	tcp_conn = g_list_append(tcp_conn, pt);
+	return pt;
+d191 8
+a198 9
+// Locate descriptor in subprocess list
+Dados *locate_process_list(int pid) {
+	GList *list = tcp_conn;
+	while (list != NULL) {
+		if (((Dados *) list->data)->pid == pid)
+			return (Dados *) list;
+		list = list->next;
+	}
+	return NULL;
+d202 3
+a204 10
+// Delete descriptor in subprocess list
+gboolean del_in_process_list(int pid, Dados *pt) {
+	if (pt == NULL)
+		pt = locate_process_list(pid);
+	if (pt != NULL) {
+		tcp_conn = g_list_remove(tcp_conn, pt);
+		return TRUE;
+	}
+	return FALSE;
+}
+d206 6
+d213 6
+a218 42
+// Callback to receive connections at TCP socket
+gboolean callback_connections_TCP(GIOChannel *source, GIOCondition condition,
+		gpointer data) {
+	char buf[180]; // buffer for receiving data
+
+	assert(main_window != NULL);
+	assert(active);
+	if (condition == G_IO_IN) {
+		// Received a new connection
+		struct sockaddr_in6 server;
+		int msgsock;
+		unsigned int length = sizeof(server);
+
+		msgsock = accept(sockTCP, (struct sockaddr *) &server, &length);
+		if (msgsock == -1) {
+			perror("accept");
+			Log("accept failed - aborting\nPlease turn off the application!\n");
+			return FALSE; // Turns callback off
+		} else {
+			sprintf(tmp_buf, "Received connection from %s - %d\n", addr_ipv6(
+					&server.sin6_addr), ntohs(server.sin6_port));
+			Log(tmp_buf);
+			// Sets the filename where the received data will be created
+			sprintf(buf, "%s/file%d.out", out_dir, counter++);
+			// Starts a thread to read the data from the socket
+			start_rcv_child_process(msgsock, buf, get_optimal());
+			// Closes the new socket at the fathers process; it stays open at the subprocess
+			close(msgsock);
+			return TRUE;
+		}
+
+	} else if ((condition == G_IO_NVAL) || (condition == G_IO_ERR)) {
+		Log("Detected error in TCP socket\n");
+		// Closes the sockets
+		close_all();
+		// Quits the application
+		gtk_main_quit();
+		return FALSE; // Stops callback for receiving connections in the socket
+	} else {
+		assert(0); // Should never reach this line
+		return FALSE; // Stops callback for receiving connections in the socket
+	}
+d222 5
+a226 136
+// Stop the transmission of all files
+void stop_all_files() {
+	GtkTreeModel *list_store = GTK_TREE_MODEL(main_window->listFiles);
+	GtkTreeIter iter;
+	gboolean valid;
+
+	// Get the first iter in the list
+	valid = gtk_tree_model_get_iter_first(list_store, &iter);
+
+	while (valid) {
+		// Walk through the list, reading each row
+		int pid;
+
+		// Make sure you terminate calls to gtk_tree_model_get() with a '-1' value
+		gtk_tree_model_get(list_store, &iter, 0, &pid, -1);
+		// Send kill!
+		send_kill(pid, SIGUSR1, FALSE);
+
+		valid = gtk_tree_model_iter_next(list_store, &iter);
+	}
+}
+
+
+// Start sending a file to the selected user - handle button "SendFile"
+void on_buttonSendFile_clicked(GtkButton *button, gpointer user_data) {
+	static char ip_str[81];
+	char *ip, *name;
+	int port;
+	struct in6_addr ip_file;
+	GtkTreeIter iter;
+
+	if (!active) {
+		Log("This program is not active\n");
+		return;
+	}
+	if (!GUI_get_selected_User(&ip, &port, &name, &iter)) {
+		Log("No user is selected\n");
+		return;
+	}
+	if (strchr(ip, ':') == NULL)
+		// Converts address IPv4 to equivalent IPv6 address
+		sprintf(ip_str, "::ffff:%s", ip);
+	else
+		strcpy(ip_str, ip);
+	if (inet_pton(AF_INET6, ip_str, &ip_file) <= 0) {
+		Log("Invalid IPv6 address found in the selected line\n");
+		return;
+	}
+	const char *filename = gtk_entry_get_text(main_window->FileName);
+	FILE *f = fopen(filename, "r");
+	if (f == NULL) {
+		Log("Select a valid file to transmit and try again\n");
+		// Open window
+		on_buttonFilename_clicked(NULL, NULL);
+		return;
+	}
+	fclose(f);
+
+	// Start sending the file
+	start_file_upload_subprocess(&ip_file, port, name, filename, get_optimal());
+}
+
+
+// Stop the selected file transmission - handle button "Stop"
+void on_buttonStop_clicked(GtkButton *button, gpointer user_data) {
+	GtkTreeIter iter;
+	int pid;
+
+	if (!GUI_get_selected_Filetx(&pid, &iter)) {
+		Log("No file transfer is selected\n");
+		return;
+	}
+	// Send kill!
+	send_kill(pid, SIGUSR1, FALSE);
+}
+
+
+/*********************************\
+|* Functions to control sockets  *|
+\*********************************/
+
+
+// Close the UDP sockets
+void close_sockUDP(void) {
+	gboolean old_changing = changing;
+	debugstr("close_sockUDP\n");
+	changing = TRUE;
+
+	if (chanUDP != NULL) {
+		if ((sockUDP4 > 0) ^ (sockUDP6 > 0)) {
+			remove_socket_from_mainloop((sockUDP4 > 0)?sockUDP4:sockUDP6, chanUDP_id, chanUDP);
+			chanUDP= NULL;
+		}
+		// It closed all sockets!
+	} else {
+		if (sockUDP4 > 0) {
+			if (str_addr_MCast4 != NULL) {
+				// Leaves the multicast group
+				if (setsockopt(sockUDP4, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+						(char *) &imr_MCast4, sizeof(imr_MCast4)) == -1) {
+					perror("Failed de-association to IPv4 multicast group");
+					sprintf(
+							tmp_buf,
+							"Failed de-association to IPv4 multicast group (%hu)\n",
+							sockUDP4);
+					Log(tmp_buf);
+				}
+			}
+			if (close(sockUDP4))
+				perror("Error during close of IPv4 multicast socket");
+		}
+		if (sockUDP6 > 0) {
+			if (str_addr_MCast6 != NULL) {
+				// Leaves the group
+				if (setsockopt(sockUDP6, IPPROTO_IPV6, IPV6_LEAVE_GROUP,
+						(char *) &imr_MCast6, sizeof(imr_MCast6)) == -1) {
+					perror("Failed de-association to IPv6 multicast group");
+					sprintf(
+							tmp_buf,
+							"Failed de-association to IPv6 multicast group (%hu)\n",
+							sockUDP6);
+					Log(tmp_buf);
+					/* NOTE: Kernel 2.4 has a bug - it does not support de-association of IPv6 groups! */
+				}
+			}
+			if (close(sockUDP6))
+				perror("Error during close of IPv6 multicast socket");
+		}
+	}
+	sockUDP4 = -1;
+	str_addr_MCast4 = NULL;
+	active4 = FALSE;
+	sockUDP6 = -1;
+	str_addr_MCast6 = NULL;
+	active6 = FALSE;
+	changing = old_changing;
+d230 3
+a232 17
+// Close TCP socket
+void close_sockTCP(void) {
+	if (chanTCP != NULL) {
+		remove_socket_from_mainloop(sockTCP, chanTCP_id, chanTCP);
+		chanTCP= NULL;
+	}
+	if (sockTCP > 0) {
+		close(sockTCP);
+		sockTCP = -1;
+	}
+	port_TCP = 0;
+}
+
+
+// Create IPv4 UDP socket, configure it, and register its callback
+// It receives configurations from global variables:
+//     port_MCast - multicast port
+d234 50
+a283 51
+	gboolean old_changing = changing;
+	char loop = 1;
+
+	if (active4)
+		return TRUE;
+
+	changing = TRUE;
+	if ((sockUDP6 > 0) || (sockUDP4 > 0)) {
+		debugstr("WARNING: 'init_sockets_udp4' closed UDP socket\n");
+		close_sockUDP();
+	}
+
+	// Prepares the data structures
+	if (!get_IPv4(addr_multicast, &addr_MCast4.sin_addr)) {
+		return FALSE;
+	}
+	addr_MCast4.sin_port = htons(port_MCast);
+	addr_MCast4.sin_family = AF_INET;
+	bcopy(&addr_MCast4.sin_addr, &imr_MCast4.imr_multiaddr,
+			sizeof(addr_MCast4.sin_addr));
+	imr_MCast4.imr_interface.s_addr = htonl(INADDR_ANY);
+
+	// Creates the IPV4 UDP socket
+	sockUDP4 = init_socket_ipv4(SOCK_DGRAM, port_MCast, TRUE);
+	fprintf(stderr, "UDP4 = %d\n", sockUDP4);
+	if (sockUDP4 < 0) {
+		Log("Failed opening IPv4 UDP socket\n");
+		return FALSE;
+	}
+	// Join the group
+	if (setsockopt(sockUDP4, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+			(char *) &imr_MCast4, sizeof(struct ip_mreq)) == -1) {
+		perror("Failed association to IPv4 multicast group");
+		Log("Failed association to IPv4 multicast group\n");
+		return FALSE;
+	}
+	str_addr_MCast4 = addr_multicast; // Memorizes it is associated to a group
+
+	// Configures the socket to receive an echo of the multicast packets sent by this application
+	setsockopt(sockUDP4, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+
+	// Regists the socket in the main loop of Gtk+
+	if (!put_socket_in_mainloop(sockUDP4, (void *) 0, &chanUDP_id, &chanUDP, G_IO_IN,
+			callback_UDP_data)) {
+		Log("Failed registration of UDPv4 socket at Gnome\n");
+		close_sockUDP();
+		return FALSE;
+	}
+	active4 = TRUE;
+	changing = old_changing;
+	return TRUE;
+d287 3
+a289 3
+// Create IPv6 UDP socket, configure it, and register its callback
+// It receives configurations from global variables:
+//     port_MCast - multicast port
+d291 4
+a294 52
+	gboolean old_changing = changing;
+	char loop = 1;
+
+	if (active6)
+		return TRUE;
+
+	changing = TRUE;
+	if ((sockUDP6 > 0) || (sockUDP4 > 0)) {
+		debugstr("WARNING: 'init_sockets_udp6' closed UDP socket\n");
+		close_sockUDP();
+	}
+
+	// Prepares the data structures
+	if (!get_IPv6(addr_multicast, &addr_MCast6.sin6_addr)) {
+		return FALSE;
+	}
+	addr_MCast6.sin6_port = htons(port_MCast);
+	addr_MCast6.sin6_family = AF_INET6;
+	addr_MCast6.sin6_flowinfo = 0;
+	bcopy(&addr_MCast6.sin6_addr, &imr_MCast6.ipv6mr_multiaddr,
+			sizeof(addr_MCast6.sin6_addr));
+	imr_MCast6.ipv6mr_interface = 0;
+
+	// Creates the IPV4 UDP socket
+	sockUDP6 = init_socket_ipv6(SOCK_DGRAM, port_MCast, TRUE);
+	fprintf(stderr, "UDP6 = %d\n", sockUDP6);
+	if (sockUDP6 < 0) {
+		Log("Failed opening IPv6 UDP socket\n");
+		return FALSE;
+	}
+	// Join the multicast group
+	if (setsockopt(sockUDP6, IPPROTO_IPV6, IPV6_JOIN_GROUP,
+			(char *) &imr_MCast6, sizeof(imr_MCast6)) == -1) {
+		perror("Failed association to IPv6 multicast group");
+		Log("Failed association to IPv6 multicast group\n");
+		return FALSE;
+	}
+	str_addr_MCast6 = addr_multicast; // Memorizes it is associated to a group
+
+	// Configures the socket to receive an echo of the multicast packets sent by this application
+	setsockopt(sockUDP6, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop, sizeof(loop));
+
+	// Regists the socket in the main loop of Gtk+
+	if (!put_socket_in_mainloop(sockUDP6, (void *) 0, &chanUDP_id, &chanUDP, G_IO_IN,
+			callback_UDP_data)) {
+		Log("Failed registration of UDPv6 socket at Gnome\n");
+		close_sockUDP();
+		return FALSE;
+	}
+	active6 = TRUE;
+	changing = old_changing;
+	return TRUE;
+d298 3
+a300 5
+// Initialize all sockets. Receives configuration from global variables:
+// str_addr_MCast4/6 - IP multicast address
+// imr_MCast4/6 - struct for association to to IP Multicast address
+// port_MCast4/6 - multicast port
+// addr_MCast4/6 - struct with UDP socket data for sending packets to the group
+a301 48
+	if (is_ipv6) {
+		if (!init_socket_udp6(addr_multicast))
+			return FALSE;
+	} else {
+		if (!init_socket_udp4(addr_multicast))
+			return FALSE;
+	}
+
+	// Socket TCP   //////////////////////////////////////////////////////////
+
+	if (sockTCP > 0) {
+		debugstr("WARNING: 'init_sockets' closed TCP socket\n");
+		close_sockTCP();
+	}
+	// Creates TCP socket
+	sockTCP = init_socket_ipv6(SOCK_STREAM, 0, FALSE);
+	if (sockTCP < 0) {
+		Log("Failed opening IPv6 TCP socket\n");
+		close_sockTCP();
+		return FALSE;
+	}
+	port_TCP = get_portnumber(sockTCP);
+	if (port_TCP == 0) {
+		Log("Failed to get the TCP port number\n");
+		close_sockUDP();
+		close_sockTCP();
+		return FALSE;
+	}
+	// Prepares the socket to receive connections
+	if (listen(sockTCP, 1) < 0) {
+		perror("Listen failed\n");
+		Log("Listen failed\n");
+		close_sockUDP();
+		close_sockTCP();
+		return FALSE;
+	}
+
+	// Regists the TCP socket in Gtk+ main loop
+	if (!put_socket_in_mainloop(sockTCP, main_window, &chanTCP_id, &chanTCP, G_IO_IN,
+			callback_connections_TCP)) {
+		Log("Failed registration of TCPv6 socket at Gnome\n");
+		close_sockUDP();
+		close_sockTCP();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+d303 13
+a315 24
+/*******************************************************\
+|* Functions to control the state of the application   *|
+\*******************************************************/
+
+
+// Closes everything
+void close_all(void) {
+	gboolean old_changing = changing;
+	changing = TRUE;
+	if (nome_timer_id > 0)
+		g_source_remove(nome_timer_id);
+	if (user_name != NULL)
+		multicast_name(FALSE);
+	close_sockUDP();
+	close_sockTCP();
+	set_portT_number(0);
+	stop_all_files();
+	if (user_name != NULL) {
+		free(user_name);
+		user_name = NULL;
+	}
+
+	GUI_clear_names();
+	changing = old_changing;
+d319 50
+a368 90
+// Button that starts and stops the application
+void on_togglebuttonActive_toggled(GtkToggleButton *togglebutton, gpointer user_data) {
+
+	if (gtk_toggle_button_get_active(main_window->active)) {
+
+		// *** Starts the server ***
+		const gchar *addr_str, *textNome;
+		gboolean is_ipv6;
+		gboolean b6 = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(main_window->check_ip6));
+		gboolean b4 = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(main_window->check_ip4));
+		assert(b4 ^ b6);
+		changing = TRUE;
+
+		// Get local IP
+		set_local_IP();
+		gtk_entry_set_text(main_window->entryIPv6loc, addr_ipv6(&local_ipv6));
+		gtk_entry_set_text(main_window->entryIPv4loc, addr_ipv4(&local_ipv4));
+		// Read parameters
+		if ((textNome = gtk_entry_get_text(main_window->entryName)) == NULL) {
+			Log("Undefined user name\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			changing = FALSE;
+			return;
+		}
+		int n = get_portM_number();
+		if (n < 0) {
+			Log("Invalid multicast port number\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			changing = FALSE;
+			return;
+		}
+		port_MCast = (unsigned short) n;
+		if (!(addr_str = get_IPmult(&is_ipv6, &addr_MCast4.sin_addr,
+				&addr_MCast6.sin6_addr))) {
+			Log("Invalid IP multicast address\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			changing = FALSE;
+			return;
+		}
+		if (b6 != is_ipv6) {
+			Log("Invalid IP version of multicast address\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			changing = FALSE;
+			return;
+		}
+		if (b6) {
+			addr_MCast6.sin6_port = htons(port_MCast);
+			addr_MCast6.sin6_family = AF_INET6;
+			addr_MCast6.sin6_flowinfo = 0;
+			bcopy(&addr_MCast6.sin6_addr, &imr_MCast6.ipv6mr_multiaddr,
+					sizeof(addr_MCast6.sin6_addr));
+			imr_MCast6.ipv6mr_interface = 0;
+		} else {
+			assert(b4); // IPv4
+			addr_MCast4.sin_port = htons(port_MCast);
+			addr_MCast4.sin_family = AF_INET;
+			bcopy(&addr_MCast4.sin_addr, &imr_MCast4.imr_multiaddr,
+					sizeof(addr_MCast4.sin_addr));
+			imr_MCast4.imr_interface.s_addr = htonl(INADDR_ANY);
+		}
+		if (!init_sockets(b6, addr_str)) {
+			Log("Failed configuration of server\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			changing = FALSE;
+			return;
+		}
+		set_portT_number(port_TCP);
+
+		// ****
+		// Starts periodical sending of the NAME
+		user_name = strdup(textNome);
+		nome_timer_id = g_timeout_add(NAME_TIMER_PERIOD, callback_name_timer,
+				NULL);
+		// ****
+		block_entrys(FALSE);
+		changing = FALSE;
+		active = TRUE;
+		// Sends the local name
+		multicast_name(TRUE);
+		Log("fileexchange active\n");
+
+	} else {
+
+		// *** Stops the server ***
+		close_all();
+		block_entrys(TRUE);
+		active = FALSE;
+		Log("fileexchange stopped\n");
+	}
+
+d372 27
+a398 22
+// IPv4 type button modified; it redefines the multicast address and the socket type
+void on_checkbuttonIPv4_toggled(GtkToggleButton *togglebutton,
+		gpointer user_data) {
+	changing = TRUE;
+	// Set IP to IPv4 multicast address
+	gboolean b4 = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(main_window->check_ip4));
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(main_window->check_ip6), !b4);
+	gtk_entry_set_text(main_window->entryMIP, g_strdup(!b4 ? "ff18:10:33::1"
+			: "225.0.0.1"));
+	if (active) {
+		if ((!b4 ? !init_socket_udp6("ff18:10:33::1") : !init_socket_udp4(
+				"225.0.0.1"))) {
+			// Creation of socket failed
+			close_all();
+			gtk_toggle_button_set_active(main_window->active, FALSE);
+		}
+	}
+	changing = FALSE;
+	if (active) {
+		// Sends its local name
+		multicast_name(TRUE);
+	}
+d402 5
+a406 22
+// IPv6 type button modified; it redefines the multicast address and the socket type
+void on_checkbuttonIPv6_toggled(GtkToggleButton *togglebutton,
+		gpointer user_data) {
+	changing = TRUE;
+	// Set IP to IPv6 multicast address
+	gboolean b6 = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(main_window->check_ip6));
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(main_window->check_ip4), !b6);
+	gtk_entry_set_text(main_window->entryMIP, g_strdup(b6 ? "ff18:10:33::1"
+			: "225.0.0.1"));
+	if (active) {
+		if ((b6 ? !init_socket_udp6("ff18:10:33::1") : !init_socket_udp4(
+				"225.0.0.1"))) {
+			// Creation of socket failed
+			close_all();
+			gtk_toggle_button_set_active(main_window->active, FALSE);
+		}
+	}
+	changing = FALSE;
+	if (active) {
+		// Sends its local name
+		multicast_name(TRUE);
+	}
+d410 3
+a412 7
+// The user closed the main window
+gboolean on_window1_delete_event(GtkWidget *widget, GdkEvent *event,
+		gpointer user_data) {
+	close_all();
+	gtk_main_quit();
+	return FALSE;
+}
+d414 18
+a431 122
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+
+
+
+/ **************************************************\
+|* Functions that handle TCP socket communication *|
+\************************************************** /
+
+/ * Change the IO event monitored in a socket to IO_READ, IO_WRITE, or (IO_READ|IO_WRITE) * /
+gboolean set_socket_callback_condition_in_mainloop(int sock, void *ptr, guint *chan_id, GIOChannel *chan,
+		guint event, gboolean(*callback)(GIOChannel *, GIOCondition, gpointer)) {
+	assert(chan_id != NULL);
+	assert(chan != NULL);
+	assert(callback != NULL);
+	if (*chan_id > 0) {
+		suspend_socket_from_mainloop(sock, *chan_id);
+		*chan_id= 0;
+	}
+	if (event != 0) {
+		return restore_socket_in_mainloop(sock, ptr, chan_id, chan, event, callback);
+	} else {
+		return TRUE;
+	}
+d435 4
+a438 4
+/ * Example callback function that handles reading/writing events from a TCP socket
+ * It returns TRUE to keep the callback active, and FALSE to disable the callback * /
+gboolean
+callback_TCP_socket (GIOChannel *source, GIOCondition condition, gpointer data)
+d440 2
+a441 2
+	static char write_buf[1024];
+//	char buf[MSG_BUFFER_SIZE];
+d443 1
+a443 2
+//	int s= g_io_channel_unix_get_fd(source); // Get the socket file descriptor
+//	int n;
+d445 113
+a557 55
+	/ *
+	Query *pt= (Query *)data;	// Recover the pointer set when the callback was defined
+	...
+	* /
+
+	if (condition & G_IO_IN)
+	{
+		// Data available for reading at socket s
+		printf("G_IO_IN\n");
+
+		// Use the following expression to read bulk data from the socket:
+		// 		n= read(s, buf, sizeof(buf));
+		// For a header field (int seq), you should use:
+		// 		n= read(s, &seq, sizeof(seq));
+		// Do not forget to test the value returned (n):
+		//	- n==0  -  EOF (connection broke)
+		//	- n<0   -  reading error in socket (test (errno==EWOULDBLOCK) if it is in non-blocking mode
+		//
+		// During a write operation with
+		//		n= write(s, buf, m);
+		//  it may return n != m when it is in the non-blocking mode!
+		//  If n==-1 and (errno==EWOULDBLOCK), or if (n>0) means that the TCP's output buffer if full.
+		//      You should enable the G_IO_OUT event in the main loop using the function
+		//	set_socket_callback_condition_in_mainloop, and wait before continuing sending data.
+		//  Store the pending data not sent in a buffer in the struct Query, so you can resend it again latter
+		//  when the event G_IO_OUT is received
+		//
+		// A socket sock can be set to non blocking mode using:
+		//		fcntl(sock,F_SETFL,O_NONBLOCK);
+
+		return TRUE;	// If there is more data coming, otherwise return FALSE;
+
+	} else if (condition & G_IO_OUT) {
+		// Space available for reading at socket s
+		printf("G_IO_OUT\n");
+
+		// This event should only be used when a write/send operation previously returned -1  with (errno==EWOULDBLOCK),
+		//     or a number of bytes below the number of bytes written. This means that the TCP's output buffer is full!
+		//
+		//	When the remaining bytes are written, do not forget to remove the G_IO_OUT event from the mainloop,
+		//		using the function set_socket_callback_condition_in_mainloop
+
+		return TRUE;  // If there is more data coming, otherwise return FALSE;
+	} else if ((condition & G_IO_NVAL) || (condition & G_IO_ERR)) {
+		printf("G_IO_NVAL or G_IO_ERR\n");
+		sprintf(write_buf, "G_IO_NVAL or G_IO_ERR - socket error %d\n", condition);
+		Log(write_buf);
+		// The query is broke - remove it
+		return FALSE;	// Removes socket's callback from main cycle
+	}
+	else
+	{
+		assert (0);		// Must never reach this line - aborts application with a core dump
+		return FALSE;	// Removes socket's callback from main cycle
+	}
+d561 17
+a577 27
+// Handle the reception of a new connection on a server socket
+// Return TRUE if it should accept more connections; FALSE otherwise
+gboolean handle_new_connection(int sock, void *ptr, struct sockaddr_in6 *cli_addr) {
+	// You should put enough information in ptr to implement this function
+	//  My recommendation is that you pass a pointer to the Query struct associated to the Query
+	Query *pt= (Query *)ptr;
+
+	// Update the information about the client socket that connected
+	//		GUI_update_cli_details_Proxy(port_SS / *put here the server socket port number* /,
+	//			g_strdup(addr_ipv6(&cli_addr->sin6_addr)), ntohs(cli_addr->sin6_port));
+
+	// You should create a new TCP socket and connect it to the remote server, with the IP:port received in the HIT packet
+	// Then, you start the two data callbacks for socket sock (connected to the client) and for the new socket
+	//    (connected to the server).
+	//		   for the client side you may use the function init_client_socket_tcp6 (complete it)
+	//         for the server side, you just need to setup the callback!
+	// Use the callback_TCP_socket function above as a model for the two callbacks you need to implement and adapt it
+	//	   to run as client or as server; read carefully the comments within the function.
+
+	// Update the information about the remote server
+	// 		GUI_update_serv_details_Proxy(port_SS / *put here the server socket port number* /,
+	//			g_strdup(server_ipv6_str), server_port);
+
+	// Don't forget to configure your socket to maximize throughput
+	//	e.g. SO_SNDBUF, non-blocking, etc.
+	//
+	return FALSE;	// Return FALSE to close the callback, avoiding other connections to the server socket
+d581 9
+a589 83
+
+
+/ *******************************************************\
+|* Functions to control the state of the application   *|
+ \******************************************************* /
+
+// Callback that handles query timeouts
+gboolean callback_query_timeout(gpointer data) {
+	Query *q = (Query *) data;
+
+	g_print("Callback query_timeout\n");
+
+	// The timer when off!
+	// Put here what you should do about it
+
+	// It should depend on the query/connection state
+
+	// If you are running a jitter timer before transmitting the Query, you should send the Query
+	// 	The jitter value can be
+	//			long int jitter_time = (long) floor(1.0 * random() / RAND_MAX * QUERY_JITTER);
+
+	// If it is waiting for a Hit, cancel the pending Query
+
+	// If it is waiting for a connection, you should cancel the server socket and the pending Query
+
+	return FALSE;	// Stops the timer
+	// return TRUE;	  // Keeps the timer running
+}
+
+
+// Handle the reception of a Query packet
+void handle_Query(char *buf, int buflen, gboolean is_ipv6,
+		struct in6_addr *ipv6, struct in_addr *ipv4, u_short port) {
+	int seq;
+	const char *fname;
+
+	assert((buf != NULL) && ((is_ipv6&&(ipv6!=NULL)) || (!is_ipv6&&(ipv4!=NULL))));
+	if (!read_query_message(buf, buflen, &seq, &fname)) {
+		Log("Invalid Query packet\n");
+		return;
+	}
+
+	assert(fname != NULL);
+	if (strcmp(fname, get_trunc_filename(fname))) {
+		Log("ERROR: The Query must not include the pathname - use 'get_trunc_filename'\n");
+		return;
+	}
+
+	char tmp_ip[100];
+	if (is_ipv6)
+		strcpy(tmp_ip, addr_ipv6(ipv6));
+	else
+		strcpy(tmp_ip, addr_ipv4(ipv4));
+	if (is_local_ip(tmp_ip) && (port == portUDPq)) {
+		// Ignore local loopback
+		return;
+	}
+
+	sprintf(tmp_buf, "Received Query '%s'(%d) from [%s]:%hu\n", fname, seq,
+			(is_ipv6 ? addr_ipv6(ipv6) : addr_ipv4(ipv4)), port);
+	Log(tmp_buf);
+
+	Log("Handle Query not implemented yet\n");
+
+	// Start here!
+
+	// Check if it is a new query (equal name+seq+is_ipv6) - ignore if it is an old one
+	// Check if the query has appeared in the !is_ipv6 domain - if it has, ignore it because someone else send it before.
+
+	// If it is new, create a new Query struct and store it in your list
+	// Store query information in list and start jitter Timer
+	//		put_in_qlist(fname, seq, is_ipv6, ipv6, ipv4, port);
+	//
+	// If you think that this is just too much for you, just use the graphical list
+
+	// Start by forwarding here the Query message to the other domain (i.e. !is_ipv6) using:
+	//		send_multicast(buf, buflen, !is_ipv6);
+	//
+	// At the end, if you have time, start here a jitter timer, which will send the Query later!
+	//	This helps when there are more than one gateway connecting two multicast groups!
+
+	// Add the query to the graphical Query list
+	GUI_add_Query(fname, seq, is_ipv6, strdup(tmp_ip), port);
+a590 166
+
+
+// Handle the reception of an Hit packet
+void handle_Hit(char *buf, int buflen, struct in6_addr *ip, u_short port,
+		gboolean is_ipv6) {
+
+	int seq;
+	const char *fname;
+	unsigned long long flen;
+	unsigned long long fhash;
+	unsigned short sTCP_port;
+
+	if (!read_hit_message(buf, buflen, &seq, &fname, &flen, &fhash,
+			&sTCP_port)) {
+		Log("Invalid Hit packet\n");
+		return;
+	}
+
+	sprintf(tmp_buf,
+			"Received Hit '%s'(%d)%s (IP= %s; port= %hu; Len=%llu; Hash=%llu)\n",
+			fname, seq, (is_ipv6?"IPv6":"IPv4"), addr_ipv6(ip), sTCP_port, flen, fhash);
+	Log(tmp_buf);
+
+	// If you have implemented the Query list, test here if this HIT matches one of the Query contents
+
+
+	// Add HIT to the graphical list
+	sprintf(tmp_buf, "%s-%hd", addr_ipv6(ip), sTCP_port);
+	GUI_add_hit_to_Query(fname, seq, !is_ipv6, tmp_buf);
+
+	Log("Handle_Hit not implemented yet\n");
+
+	if (!is_ipv6) {
+		// HIT received from an IPv4 server
+
+		// Send the HIT message to the client
+		// You may get the client information from your Query list
+
+		// If you did not do it, you may also get the client's information from the graphical table using
+		//		GUI_get_Query_details(const char *filename, int seq, gboolean is_ipv6, const char **str_ip, unsigned int *port, const char **hits)
+		//	   str_ip has the IP address and port has the port number.
+
+		// Send the HIT packet to the client
+		//    you may use the function send_M6reply ...
+
+		// In order to avoid not seeing the Query in the graphical table, I recommend that you let the timer clear it.
+		// Wait for timeout to clear the GUI entry
+		// Otherwise, you can clear it here using:
+		//		GUI_del_Query(fname, (*ppt)->seq, (*ppt)->is_ipv6);
+		return;
+	}
+
+	// HIT received from an IPv6 server
+	// In this case you need to create a new proxy server
+	// You should use fields in the Query struct to store all the information about the proxy
+
+	// Create a new server socket using:
+	//		init_server_socket_tcp6 (complete it!)
+	// Store all the socket information in the Query structure
+
+	// Write the proxy information in the proxies list
+	//		GUI_add_Proxy(fname, seq, proxy_server_socket_port);
+
+	// Prepare a new HIT message with the proxy information and send it to the client.
+	// Use
+	//		send_message4(&client_ipv4_address, client_port, HIT_buffer, HIT_buflen)
+
+	// Restart the timer, to wait for QUERY_TIMEOUT seconds for a connection
+}
+
+
+// Callback button 'Stop': stops the selected TCP transmission and associated proxy
+void on_buttonStop_clicked(GtkButton *button, gpointer user_data) {
+	GtkTreeIter	iter;
+	const char *fname;
+	int seq;
+	u_int Tport;
+
+
+	if (GUI_get_selected_Proxy(&fname, &seq, &Tport, &iter)) {
+#ifdef DEBUG
+		g_print ("Proxy with port %d will be stopped\n", Tport);
+#endif
+	} else {
+		Log ("No proxy selected\n");
+		return;
+	}
+	if (Tport <= 0) {
+		Log("Invalid TCP port in the selected line\n");
+		return;
+	}
+
+	gtk_list_store_remove(main_window->listProxies, &iter);
+
+	// Stop proxy
+	// ...
+	Log("on_buttonStop_clicked not implemented yet\n");
+
+}
+
+
+// Closes everything
+void close_all(void) {
+	// Stop all proxies active
+	Log("close_all does not stop the ongoing Queries and Proxies yet\n");
+	// Close all sockets
+	close_sockUDP();
+}
+
+
+// Button that starts and stops the application
+void on_togglebutton1_toggled(GtkToggleButton *togglebutton, gpointer user_data) {
+
+	if (gtk_toggle_button_get_active(togglebutton)) {
+
+		// *** Starts the server ***
+		const gchar *addr4_str, *addr6_str;
+		int n4, n6;
+
+		n4 = get_PortIPv4Multicast();
+		n6 = get_PortIPv6Multicast();
+		if ((n4 < 0) || (n6 < 0)) {
+			Log("Invalid multicast port number\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			return;
+		}
+		port_MCast4 = (unsigned short) n4;
+		port_MCast6 = (unsigned short) n6;
+
+		addr6_str = get_IPv6Multicast(NULL);
+		addr4_str = get_IPv4Multicast(NULL);
+		if (!addr6_str && !addr4_str) {
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			return;
+		}
+		if (!init_sockets(port_MCast4, addr4_str, port_MCast6, addr6_str)) {
+			Log("Failed configuration of server\n");
+			gtk_toggle_button_set_active(togglebutton, FALSE); // Turns button off
+			return;
+		}
+		//set_PortTCP(port_TCP);
+		set_PID(getpid());
+		//
+		block_entrys(TRUE);
+		active = TRUE;
+		Log("gateway active\n");
+
+	} else {
+
+		// *** Stops the server ***
+		close_all();
+		block_entrys(FALSE);
+		set_PID(0);
+		active = FALSE;
+		Log("gateway stopped\n");
+	}
+
+}
+
+
+// Callback function that handles the end of the closing of the main window
+gboolean on_window1_delete_event(GtkWidget * widget, GdkEvent * event,
+		gpointer user_data) {
+	gtk_main_quit();	// Close Gtk main cycle
+	return FALSE;		// Must always return FALSE; otherwise the window is not closed.
+}*/

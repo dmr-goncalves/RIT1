@@ -1,0 +1,15 @@
+d2 9
+a10 2
+|*  RIT I - MIEEC - FCT/UNL				Luis Bernardo	     *|
+|*            subprocess.h						     *|
+d12 1
+d17 2
+a18 1
+#include <gnome.h>
+d23 14
+d38 3
+a40 3
+// Envia sinal a processo
+void send_kill(int pid, int sig, gboolean pode_falhar);
+// Callback de sinal SIGCHLD no processo principal
+d42 11
